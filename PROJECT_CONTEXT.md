@@ -1,4 +1,8 @@
 # Emergent — AV Performance System
+
+### Repository
+https://github.com/Milesy1/emergent-av
+
 ## Project Context for Cursor Sessions
 
 ### START OF SESSION CHECKLIST
