@@ -1,0 +1,783 @@
+import random
+
+# NOTE: This file should be loaded as a DAT at: /project1/python_logic/parameter_mod_DAT
+# chopexec1.py references this path, so ensure the DAT is located correctly in TouchDesigner
+
+# Debug mode flag - set to True to enable verbose debug output
+DEBUG_MODE = False
+
+# ============================================================================
+# SOP COOKING OPTIMIZATION - Performance Improvement
+# ============================================================================
+# Force cooking can be expensive. Set to False to let TouchDesigner cook naturally.
+# If False: Parameters update on next natural cook cycle (usually immediate, but not guaranteed)
+# If True: Forces immediate cook (guaranteed immediate update, but more CPU intensive)
+# Default: False (optimized) - Set to True if parameters don't update fast enough
+FORCE_COOK_SOPS = False
+
+# Track last note for Mode 2 (note turns ON, different note turns OFF)
+mode2_last_note = {}
+
+# Track toggle states for Mode 3 (last note wins - any note press toggles)
+mode3_states = {}
+
+# ============================================================================
+# TABLE CACHING - Performance Improvement
+# ============================================================================
+# Cache mapping tables to avoid reading on every MIDI event
+# Cache is invalidated when table structure changes (rows/columns)
+_mapping_cache = {
+    'switch': None,          # Cached switch mappings
+    'geometry': None,         # Cached geometry mappings
+    'cc': None,              # Cached CC mappings (supports one-to-many)
+    'switch_rows': 0,        # Row count when cached (for invalidation)
+    'geometry_rows': 0,      # Row count when cached (for invalidation)
+    'cc_rows': 0,            # Row count when cached (for invalidation)
+    'switch_cols': 0,        # Column count when cached
+    'geometry_cols': 0,      # Column count when cached
+    'cc_cols': 0             # Column count when cached
+}
+
+def clear_mapping_cache():
+    """Clear the mapping cache - useful for debugging or manual refresh"""
+    global _mapping_cache
+    _mapping_cache = {
+        'switch': None,
+        'geometry': None,
+        'cc': None,
+        'switch_rows': 0,
+        'geometry_rows': 0,
+        'cc_rows': 0,
+        'switch_cols': 0,
+        'geometry_cols': 0,
+        'cc_cols': 0
+    }
+    debug_print("[CACHE] Mapping cache cleared")
+
+def debug_print(msg):
+    """Conditional debug print function"""
+    if DEBUG_MODE:
+        print(msg)
+
+def calculate_velocity_value(min_val, max_val, velocity, is_boolean=False):
+    """
+    Calculate parameter value based on velocity using linear interpolation.
+    
+    Args:
+        min_val: Minimum parameter value
+        max_val: Maximum parameter value
+        velocity: MIDI velocity (0-127)
+        is_boolean: If True, treats as boolean parameter (velocity >= 64 = max, < 64 = min)
+    
+    Returns:
+        Scaled value between min_val and max_val based on velocity
+    """
+    # Clamp velocity to valid range
+    velocity = max(0, min(127, velocity))
+    
+    if is_boolean:
+        # For boolean: velocity >= 64 = True (max), < 64 = False (min)
+        return bool(max_val) if velocity >= 64 else bool(min_val)
+    else:
+        # For numeric: linear interpolation
+        # Formula: value = min + (max - min) * (velocity / 127.0)
+        velocity_factor = velocity / 127.0  # 0.0 to 1.0
+        return min_val + (max_val - min_val) * velocity_factor
+
+def get_sop_par(geo_path, par_name):
+    """
+    Get a SOP and parameter object by path and parameter name.
+    
+    Args:
+        geo_path (str): Path to the SOP operator
+        par_name (str): Name of the parameter to find
+    
+    Returns:
+        tuple: (sop, par) where sop is the operator and par is the parameter object.
+               Returns (None, None) if SOP not found, (sop, None) if parameter not found.
+    """
+    # Input validation
+    if not geo_path or not isinstance(geo_path, str):
+        debug_print(f"[ERROR] Invalid geo_path: {geo_path}")
+        return None, None
+    if not par_name or not isinstance(par_name, str):
+        debug_print(f"[ERROR] Invalid par_name: {par_name}")
+        return None, None
+    
+    sop = op(geo_path)
+    if sop is None:
+        debug_print(f"[ERROR] SOP not found: {geo_path}")
+        return None, None
+    
+    # Method 1: Try iterating through pars() to find by name (most reliable for Switch SOPs)
+    try:
+        for p in sop.pars():
+            if hasattr(p, 'name'):
+                if p.name == par_name:
+                    debug_print(f"[DEBUG] Found parameter '{par_name}' via pars() iteration")
+                    debug_print(f"[DEBUG] Parameter object type: {type(p)}, has val attr: {hasattr(p, 'val')}")
+                    if hasattr(p, 'val'):
+                        debug_print(f"[DEBUG] Parameter value: {p.val}")
+                    return sop, p
+                # Debug: show what we're comparing
+                if DEBUG_MODE and ('input' in par_name.lower() or 'input' in p.name.lower()):
+                    debug_print(f"[DEBUG] Comparing: p.name='{p.name}' (type: {type(p.name)}) vs par_name='{par_name}' (type: {type(par_name)})")
+    except Exception as e:
+        debug_print(f"[DEBUG] Exception in pars() iteration: {e}")
+        pass
+    # Method 2: Try dictionary access
+    try:
+        par = sop.par[par_name]
+        if hasattr(par, 'val'):  # Make sure it's a parameter object
+            return sop, par
+    except (KeyError, AttributeError, TypeError):
+        pass
+    # Method 3: Try attribute access (may return value, not object)
+    try:
+        par = getattr(sop.par, par_name)
+        # If it's a number, it's a value, not an object - need to find the actual parameter
+        if isinstance(par, (int, float)):
+            # Try to find it via pars() again
+            for p in sop.pars():
+                if hasattr(p, 'name') and p.name == par_name:
+                    return sop, p
+        elif hasattr(par, 'val'):
+            return sop, par
+    except AttributeError:
+        pass
+    return sop, None
+
+def get_mappings_from_table():
+    """
+    Read MIDI note mappings from the mappings_table.
+    
+    Reads note mappings that control geometry parameters with random values or velocity-scaled values.
+    Supports one-to-many mappings (multiple rows with same note can map to different parameters).
+    Table format: note, geo_path, param_name, min_value, max_value, use_velocity
+    
+    Returns:
+        dict: Dictionary mapping note numbers to lists of mapping dictionaries
+              Format: {note: [{'geo': path, 'param': name, 'min': float, 'max': float, 'use_velocity': int}, ...]}
+              Empty list if no mappings for a note number.
+    """
+    global _mapping_cache
+    
+    # Check cache first
+    table = op('/simple_midi_mapper/mappings_table')
+    if not table:
+        return {}
+    
+    # Check if cache is valid (table structure unchanged)
+    if (_mapping_cache['geometry'] is not None and 
+        _mapping_cache['geometry_rows'] == table.numRows and
+        _mapping_cache['geometry_cols'] == table.numCols):
+        debug_print("[CACHE] Using cached geometry mappings")
+        return _mapping_cache['geometry']
+    
+    # Cache miss or invalid - read table
+    debug_print("[CACHE] Reading geometry mappings from table (cache miss or table changed)")
+    mappings = {}
+    # Verify table has required columns (note, geo, param, min, max = 5 columns minimum)
+    if table.numCols < 5:
+        print(f"[MAPPING ERROR] Table has only {table.numCols} columns, need at least 5")
+        return {}
+    for i in range(1, table.numRows):
+        try:
+            # Skip header rows or empty rows
+            note_val = table[i, 0]
+            if not note_val or str(note_val).strip().lower() in ('note', ''):
+                continue
+            # Validate note number is within MIDI range (0-127)
+            note = int(note_val)
+            if not (0 <= note <= 127):
+                print(f"[MAPPING ERROR] Row {i}: Invalid note number {note} (must be 0-127)")
+                continue
+            # Get values with bounds checking
+            geo = table[i, 1].val if table.numCols > 1 else ''
+            param = table[i, 2].val if table.numCols > 2 else ''
+            if not geo or not param:
+                continue
+            # Use float() to support decimal values (e.g., 0.1, 2.0)
+            min_val = float(table[i, 3]) if table.numCols > 3 else 0.0
+            max_val = float(table[i, 4]) if table.numCols > 4 else 0.0
+            # Get use_velocity (optional column 5, default to 0 for backward compatibility)
+            use_velocity = int(table[i, 5].val) if table.numCols > 5 else 0
+            # Validate min <= max
+            if min_val > max_val:
+                print(f"[MAPPING ERROR] Row {i}: Note {note}: min ({min_val}) > max ({max_val})")
+                continue
+            
+            # Create mapping entry
+            mapping_entry = {
+                'geo': geo,
+                'param': param,
+                'min': min_val,
+                'max': max_val,
+                'use_velocity': use_velocity
+            }
+            
+            # Support one-to-many: append to list if note already exists
+            if note not in mappings:
+                mappings[note] = []
+            mappings[note].append(mapping_entry)
+            
+        except ValueError as e:
+            print(f"[MAPPING ERROR] Row {i}: Failed to convert value to float/int: {e}")
+        except IndexError as e:
+            print(f"[MAPPING ERROR] Row {i}: Table index out of bounds: {e}")
+        except Exception as e:
+            print(f"[MAPPING ERROR] Row {i}: Unexpected error: {e}")
+    
+    # Update cache
+    _mapping_cache['geometry'] = mappings
+    _mapping_cache['geometry_rows'] = table.numRows
+    _mapping_cache['geometry_cols'] = table.numCols
+    debug_print(f"[CACHE] Cached {len(mappings)} geometry mappings (with one-to-many support)")
+    
+    return mappings
+
+def get_switch_mappings():
+    """Read switch SOPs from midi_reactive_mappings table"""
+    global _mapping_cache
+    
+    # Check cache first
+    table = op('/simple_midi_mapper/midi_reactive_mappings')
+    if not table:
+        return {}
+    
+    # Check if cache is valid (table structure unchanged)
+    if (_mapping_cache['switch'] is not None and 
+        _mapping_cache['switch_rows'] == table.numRows and
+        _mapping_cache['switch_cols'] == table.numCols):
+        debug_print("[CACHE] Using cached switch mappings")
+        return _mapping_cache['switch']
+    
+    # Cache miss or invalid - read table
+    debug_print("[CACHE] Reading switch mappings from table (cache miss or table changed)")
+    mappings = {}
+    # Verify table has required columns (note, sop_path, param, min, max, mode = 6 columns minimum)
+    if table.numCols < 6:
+        print(f"[SWITCH ERROR] Table has only {table.numCols} columns, need at least 6")
+        return {}
+    for i in range(1, table.numRows):
+        try:
+            # Get note value safely
+            if table.numCols < 1:
+                continue
+            note_val = table[i, 0].val
+            # Convert to string if needed, then check if empty
+            note_str = str(note_val).strip() if note_val else ''
+            if not note_str:
+                continue
+            # Validate note number is within MIDI range (0-127)
+            note = int(note_str)
+            if not (0 <= note <= 127):
+                print(f"[SWITCH ERROR] Row {i}: Invalid note number {note} (must be 0-127)")
+                continue
+            # Get SOP path safely
+            if table.numCols < 2:
+                continue
+            sop_path_val = table[i, 1].val if table.numCols > 1 else ''
+            sop_path = str(sop_path_val).strip() if sop_path_val else ''
+            # Remove trailing slash if present
+            sop_path = sop_path.rstrip('/')
+            if not sop_path:
+                continue
+            # Get parameter name safely
+            if table.numCols < 3:
+                continue
+            param_val = table[i, 2].val if table.numCols > 2 else ''
+            param = str(param_val).strip() if param_val else ''
+            # Get min/max values safely
+            if table.numCols < 5:
+                continue
+            min_val = float(table[i, 3].val) if table.numCols > 3 else 0.0
+            max_val = float(table[i, 4].val) if table.numCols > 4 else 0.0
+            # Validate min <= max
+            if min_val > max_val:
+                print(f"[SWITCH ERROR] Row {i}: Note {note}: min ({min_val}) > max ({max_val})")
+                continue
+            # Get mode safely
+            if table.numCols < 6:
+                continue
+            mode = int(table[i, 5].val) if table.numCols > 5 else 1
+            # Validate mode is 1, 2, or 3
+            if mode not in (1, 2, 3):
+                print(f"[SWITCH ERROR] Row {i}: Note {note}: Invalid mode {mode} (must be 1, 2, or 3)")
+                continue
+            # Get use_velocity (optional column 6, default to 0 for backward compatibility)
+            use_velocity = int(table[i, 6].val) if table.numCols > 6 else 0
+            mappings[note] = {
+                'geo': sop_path,
+                'param': param,
+                'min': min_val,
+                'max': max_val,
+                'mode': mode,
+                'use_velocity': use_velocity
+            }
+        except ValueError as e:
+            print(f"[SWITCH ERROR] Row {i}: Failed to convert value to int: {e}")
+        except IndexError as e:
+            print(f"[SWITCH ERROR] Row {i}: Table index out of bounds: {e}")
+        except Exception as e:
+            print(f"[SWITCH ERROR] Row {i}: Unexpected error: {e}")
+    
+    # Update cache
+    _mapping_cache['switch'] = mappings
+    _mapping_cache['switch_rows'] = table.numRows
+    _mapping_cache['switch_cols'] = table.numCols
+    debug_print(f"[CACHE] Cached {len(mappings)} switch mappings")
+    
+    return mappings
+
+def get_cc_mappings():
+    """
+    Read CC (Control Change) mappings from the cc_mappings table.
+    
+    Supports one-to-many mappings (multiple rows with same CC number can map to different parameters).
+    Table format: cc_number, sop_path, param_name, min_value, max_value
+    
+    Returns:
+        dict: Dictionary mapping CC numbers to lists of mapping dictionaries
+              Format: {cc: [{'geo': path, 'param': name, 'min': int, 'max': int}, ...]}
+              Empty list if no mappings for a CC number.
+    """
+    global _mapping_cache
+    
+    # Check cache first
+    table = op('/simple_midi_mapper/cc_mappings')
+    if not table:
+        return {}
+    
+    # Check if cache is valid (table structure unchanged)
+    if (_mapping_cache['cc'] is not None and 
+        _mapping_cache['cc_rows'] == table.numRows and
+        _mapping_cache['cc_cols'] == table.numCols):
+        debug_print("[CACHE] Using cached CC mappings")
+        return _mapping_cache['cc']
+    
+    # Cache miss or invalid - read table
+    debug_print("[CACHE] Reading CC mappings from table (cache miss or table changed)")
+    mappings = {}
+    
+    # Verify table has required columns (cc, sop_path, param, min, max = 5 columns minimum)
+    if table.numCols < 5:
+        print(f"[CC ERROR] Table has only {table.numCols} columns, need at least 5")
+        return {}
+    
+    for i in range(1, table.numRows):
+        try:
+            # Get CC value safely
+            if table.numCols < 1:
+                continue
+            cc_val = table[i, 0].val
+            # Convert to string if needed, then check if empty
+            cc_str = str(cc_val).strip() if cc_val else ''
+            if not cc_str:
+                continue
+            
+            # Validate CC number is within MIDI range (0-127)
+            cc = int(cc_str)
+            if not (0 <= cc <= 127):
+                print(f"[CC ERROR] Row {i}: Invalid CC number {cc} (must be 0-127)")
+                continue
+            
+            # Get SOP path safely
+            if table.numCols < 2:
+                continue
+            sop_path_val = table[i, 1].val if table.numCols > 1 else ''
+            sop_path = str(sop_path_val).strip() if sop_path_val else ''
+            # Remove trailing slash if present
+            sop_path = sop_path.rstrip('/')
+            if not sop_path:
+                continue
+            
+            # Get parameter name safely
+            if table.numCols < 3:
+                continue
+            param_val = table[i, 2].val if table.numCols > 2 else ''
+            param = str(param_val).strip() if param_val else ''
+            if not param:
+                continue
+            
+            # Get min/max values safely
+            if table.numCols < 5:
+                continue
+            min_val = float(table[i, 3].val) if table.numCols > 3 else 0.0
+            max_val = float(table[i, 4].val) if table.numCols > 4 else 0.0
+            
+            # Validate min <= max
+            if min_val > max_val:
+                print(f"[CC ERROR] Row {i}: CC {cc}: min ({min_val}) > max ({max_val})")
+                continue
+            
+            # Create mapping entry
+            mapping_entry = {
+                'geo': sop_path,
+                'param': param,
+                'min': min_val,
+                'max': max_val
+            }
+            
+            # Support one-to-many: append to list if CC already exists
+            if cc not in mappings:
+                mappings[cc] = []
+            mappings[cc].append(mapping_entry)
+            
+        except ValueError as e:
+            print(f"[CC ERROR] Row {i}: Failed to convert value to int: {e}")
+        except IndexError as e:
+            print(f"[CC ERROR] Row {i}: Table index out of bounds: {e}")
+        except Exception as e:
+            print(f"[CC ERROR] Row {i}: Unexpected error: {e}")
+    
+    # Update cache
+    _mapping_cache['cc'] = mappings
+    _mapping_cache['cc_rows'] = table.numRows
+    _mapping_cache['cc_cols'] = table.numCols
+    debug_print(f"[CACHE] Cached {len(mappings)} CC mappings (with one-to-many support)")
+    
+    return mappings
+
+def apply_note_modulation(note, velocity):
+    """
+    Called when MIDI note is pressed (ON).
+    
+    Applies modulation based on mapping tables:
+    1. Switch mappings (priority) - Mode 1 (momentary), Mode 2 (toggle), or Mode 3 (last note wins)
+    2. Geometry mappings - Random value between min/max, or velocity-scaled if enabled
+    
+    Velocity sensitivity:
+    - If use_velocity = 1 in mapping table: scales value between min/max based on velocity (0-127)
+    - If use_velocity = 0 or missing: uses original behavior (max for switch modes, random for geometry)
+    - For boolean parameters: velocity >= 64 = True (max), < 64 = False (min)
+    
+    Args:
+        note (int): MIDI note number (0-127)
+        velocity (int): MIDI velocity (0-127) - used for velocity-sensitive mappings
+    """
+    # Check switch table first (priority)
+    switch_mappings = get_switch_mappings()
+    if note in switch_mappings:
+        target = switch_mappings[note]
+        sop, par = get_sop_par(target['geo'], target['param'])
+        if sop is None:
+            print(f"[SWITCH ERROR] Note {note}: SOP not found: {target['geo']}")
+            return
+        if par is None:
+            print(f"[SWITCH ERROR] Note {note}: Parameter '{target['param']}' not found on {target['geo']}")
+            return
+        # Check if par has .val attribute (it's a valid parameter object)
+        if not hasattr(par, 'val'):
+            print(f"[SWITCH ERROR] Note {note}: Parameter object doesn't have .val attribute")
+            return
+        
+        # Check if parameter is boolean (like 'render')
+        is_boolean = isinstance(par.val, bool)
+        
+        if target['mode'] == 1:
+            # Mode 1: Momentary - set value on press (scaled by velocity if enabled)
+            try:
+                # Check if velocity sensitivity is enabled
+                use_velocity = target.get('use_velocity', 0)
+                if use_velocity:
+                    # Scale value based on velocity
+                    val = calculate_velocity_value(target['min'], target['max'], velocity, is_boolean)
+                else:
+                    # Original behavior: always use max
+                    if is_boolean:
+                        val = bool(target['max'])  # Convert 0/1 to False/True
+                    else:
+                        val = target['max']
+                par.val = val
+                # Optimized cooking: only force cook if configured
+                if FORCE_COOK_SOPS:
+                    sop.cook(force=True)
+                else:
+                    sop.cook()  # Let TouchDesigner cook naturally (faster, usually immediate)
+                velocity_info = f" (velocity={velocity})" if use_velocity else ""
+                print(f"[SWITCH MODE 1] Note {note} ON -> {target['geo']}.{target['param']} = {val}{velocity_info}")
+            except Exception as e:
+                print(f"[SWITCH ERROR] Note {note}: Failed to set parameter value: {e}")
+        elif target['mode'] == 2:
+            # Mode 2: Note turns ON, different note turns OFF
+            map_key = f"{target['geo']}.{target['param']}"
+            
+            # Check if this is the same note as last time
+            if map_key in mode2_last_note and mode2_last_note[map_key] == note:
+                # Same note pressed - do nothing (already ON)
+                return
+            
+            # Different note (or first time) - turn ON
+            # If it was a different note before, turn OFF first, then this note turns ON
+            if map_key in mode2_last_note:
+                # Different note was pressed - turn OFF first
+                is_boolean = isinstance(par.val, bool)
+                try:
+                    if is_boolean:
+                        off_val = bool(target['min'])
+                    else:
+                        off_val = target['min']
+                    par.val = off_val
+                    if FORCE_COOK_SOPS:
+                        sop.cook(force=True)
+                    else:
+                        sop.cook()
+                except Exception as e:
+                    print(f"[SWITCH ERROR] Note {note}: Failed to set OFF value: {e}")
+            
+            # Now turn ON with new note
+            mode2_last_note[map_key] = note
+            
+            # Check if parameter is boolean (like 'render')
+            is_boolean = isinstance(par.val, bool)
+            
+            try:
+                # Check if velocity sensitivity is enabled
+                use_velocity = target.get('use_velocity', 0)
+                if use_velocity:
+                    # Scale value based on velocity
+                    val = calculate_velocity_value(target['min'], target['max'], velocity, is_boolean)
+                else:
+                    # Original behavior: always use max
+                    if is_boolean:
+                        val = bool(target['max'])  # Convert 0/1 to False/True
+                    else:
+                        val = target['max']
+                par.val = val
+                # Optimized cooking: only force cook if configured
+                if FORCE_COOK_SOPS:
+                    sop.cook(force=True)
+                else:
+                    sop.cook()  # Let TouchDesigner cook naturally (faster, usually immediate)
+                velocity_info = f" (velocity={velocity})" if use_velocity else ""
+                print(f"[SWITCH MODE 2] Note {note} ON -> {target['geo']}.{target['param']} = {val}{velocity_info}")
+            except Exception as e:
+                print(f"[SWITCH ERROR] Note {note}: Failed to set Mode 2 value: {e}")
+        elif target['mode'] == 3:
+            # Mode 3: Last note wins - any note press toggles (ignores note OFF)
+            current_val = par.val
+            map_key = f"{target['geo']}.{target['param']}"
+            use_velocity = target.get('use_velocity', 0)
+            
+            if is_boolean:
+                # For boolean: False (min) = 0, True (max) = 1
+                min_bool = bool(target['min'])
+                max_bool = bool(target['max'])
+                # Initialize state if not exists
+                if map_key not in mode3_states:
+                    mode3_states[map_key] = (current_val == max_bool)
+                # Toggle state
+                mode3_states[map_key] = not mode3_states[map_key]
+                # When toggling ON (True), use velocity if enabled; when OFF (False), always use min
+                if mode3_states[map_key]:
+                    if use_velocity:
+                        new_val = calculate_velocity_value(target['min'], target['max'], velocity, is_boolean=True)
+                    else:
+                        new_val = max_bool
+                else:
+                    new_val = min_bool
+            else:
+                # For numeric: use min/max as-is
+                # Initialize state if not exists
+                if map_key not in mode3_states:
+                    mode3_states[map_key] = (current_val == target['max'])
+                # Toggle state
+                mode3_states[map_key] = not mode3_states[map_key]
+                # When toggling ON (True), use velocity if enabled; when OFF (False), always use min
+                if mode3_states[map_key]:
+                    if use_velocity:
+                        new_val = calculate_velocity_value(target['min'], target['max'], velocity, is_boolean=False)
+                    else:
+                        new_val = target['max']
+                else:
+                    new_val = target['min']
+            
+            try:
+                par.val = new_val
+                # Optimized cooking: only force cook if configured
+                if FORCE_COOK_SOPS:
+                    sop.cook(force=True)
+                else:
+                    sop.cook()  # Let TouchDesigner cook naturally (faster, usually immediate)
+                velocity_info = f" (velocity={velocity})" if (use_velocity and mode3_states[map_key]) else ""
+                print(f"[SWITCH MODE 3] Note {note} TOGGLE -> {target['geo']}.{target['param']} = {new_val} (was {current_val}){velocity_info}")
+            except Exception as e:
+                print(f"[SWITCH ERROR] Note {note}: Failed to set Mode 3 toggle value: {e}")
+        return
+    
+    # Check geometry table (random behavior or velocity-based)
+    # Supports one-to-many mappings (one note can control multiple parameters)
+    mappings = get_mappings_from_table()
+    if note in mappings and mappings[note]:
+        # Get list of mappings for this note (supports one-to-many)
+        targets = mappings[note]
+        
+        # Process each mapping (one-to-many support)
+        for target in targets:
+            # Additional safety check: ensure min <= max (should already be validated in get_mappings_from_table)
+            if target['min'] > target['max']:
+                print(f"[GEOMETRY ERROR] Note {note}: Invalid range min ({target['min']}) > max ({target['max']})")
+                continue
+            
+            sop, par = get_sop_par(target['geo'], target['param'])
+            if sop is None:
+                print(f"[GEOMETRY ERROR] Note {note}: SOP not found: {target['geo']}")
+                continue
+            if par is None:
+                print(f"[GEOMETRY ERROR] Note {note}: Parameter '{target['param']}' not found on {target['geo']}")
+                continue
+            if not hasattr(par, 'val'):
+                print(f"[GEOMETRY ERROR] Note {note}: Parameter object doesn't have .val attribute")
+                continue
+            
+            try:
+                # Check if velocity sensitivity is enabled
+                use_velocity = target.get('use_velocity', 0)
+                if use_velocity:
+                    # Use velocity-scaled value instead of random
+                    is_boolean = isinstance(par.val, bool)
+                    val = calculate_velocity_value(target['min'], target['max'], velocity, is_boolean)
+                    par.val = val
+                    # Optimized cooking: only force cook if configured
+                    if FORCE_COOK_SOPS:
+                        sop.cook(force=True)
+                    else:
+                        sop.cook()  # Let TouchDesigner cook naturally (faster, usually immediate)
+                    print(f"[GEOMETRY VELOCITY] Note {note} (velocity={velocity}) -> {target['geo']}.{target['param']} = {val}")
+                else:
+                    # Original behavior: random value (supports both int and float)
+                    if isinstance(target['min'], int) and isinstance(target['max'], int):
+                        random_val = random.randint(target['min'], target['max'])
+                    else:
+                        # For float values, use uniform distribution
+                        random_val = random.uniform(target['min'], target['max'])
+                    par.val = random_val
+                    # Optimized cooking: only force cook if configured
+                    if FORCE_COOK_SOPS:
+                        sop.cook(force=True)
+                    else:
+                        sop.cook()  # Let TouchDesigner cook naturally (faster, usually immediate)
+                    print(f"[GEOMETRY RANDOM] Note {note} -> {target['geo']}.{target['param']} = {random_val}")
+            except ValueError as e:
+                print(f"[GEOMETRY ERROR] Note {note}: Failed to generate value for {target['geo']}.{target['param']}: {e}")
+            except Exception as e:
+                print(f"[GEOMETRY ERROR] Note {note}: Failed to set parameter {target['geo']}.{target['param']}: {e}")
+
+def apply_note_off(note):
+    """
+    Called when MIDI note is released (OFF) - only for Mode 1 (momentary).
+    
+    Sets the parameter back to min_val when note is released.
+    Mode 2 (toggle) and Mode 3 (last note wins) don't need OFF handling since they're latch-based.
+    
+    Args:
+        note (int): MIDI note number (0-127)
+    """
+    switch_mappings = get_switch_mappings()
+    if note in switch_mappings:
+        target = switch_mappings[note]
+        if target['mode'] == 1:
+            # Mode 1: Momentary - set to min_val on release
+            sop, par = get_sop_par(target['geo'], target['param'])
+            if sop is None or par is None:
+                return
+            if not hasattr(par, 'val'):
+                return
+            
+            # Check if parameter is boolean (like 'render')
+            is_boolean = isinstance(par.val, bool)
+            
+            try:
+                if is_boolean:
+                    val = bool(target['min'])  # Convert 0/1 to False/True
+                else:
+                    val = target['min']
+                par.val = val
+                # Optimized cooking: only force cook if configured
+                if FORCE_COOK_SOPS:
+                    sop.cook(force=True)
+                else:
+                    sop.cook()  # Let TouchDesigner cook naturally (faster, usually immediate)
+                print(f"[SWITCH MODE 1] Note {note} OFF -> {target['geo']}.{target['param']} = {val}")
+            except Exception as e:
+                print(f"[SWITCH ERROR] Note {note}: Failed to set OFF value: {e}")
+
+def apply_cc_modulation(cc_number, cc_value):
+    """
+    Called when MIDI CC (Control Change) value changes.
+    
+    Maps CC value (0-127) to parameter range (min-max) using linear interpolation.
+    Supports one-to-many mappings (one CC can control multiple parameters).
+    
+    Args:
+        cc_number (int): MIDI CC number (0-127)
+        cc_value (int): MIDI CC value (0-127)
+    """
+    # Validate inputs
+    if not (0 <= cc_number <= 127):
+        print(f"[CC ERROR] Invalid CC number {cc_number} (must be 0-127)")
+        return
+    if not (0 <= cc_value <= 127):
+        print(f"[CC ERROR] Invalid CC value {cc_value} (must be 0-127)")
+        return
+    
+    # Get CC mappings (returns dict with lists for one-to-many support)
+    cc_mappings = get_cc_mappings()
+    
+    # Check if CC has any mappings
+    if cc_number not in cc_mappings or not cc_mappings[cc_number]:
+        # No mappings for this CC - silently return (not an error)
+        debug_print(f"[CC] No mappings found for CC {cc_number}")
+        return
+    
+    # Get list of mappings for this CC (supports one-to-many)
+    targets = cc_mappings[cc_number]
+    
+    # Process each mapping (one-to-many support)
+    for target in targets:
+        sop, par = get_sop_par(target['geo'], target['param'])
+        
+        if sop is None:
+            print(f"[CC ERROR] CC {cc_number}: SOP not found: {target['geo']}")
+            continue
+        
+        if par is None:
+            print(f"[CC ERROR] CC {cc_number}: Parameter '{target['param']}' not found on {target['geo']}")
+            continue
+        
+        # Check if par has .val attribute (it's a valid parameter object)
+        if not hasattr(par, 'val'):
+            print(f"[CC ERROR] CC {cc_number}: Parameter object doesn't have .val attribute")
+            continue
+        
+        # Check if parameter is boolean (like 'render')
+        is_boolean = isinstance(par.val, bool)
+        
+        try:
+            # Map CC value (0-127) to parameter range (min-max) using linear interpolation
+            # Formula: mapped_val = min + (max - min) * (cc_value / 127.0)
+            min_val = target['min']
+            max_val = target['max']
+            
+            if is_boolean:
+                # For boolean: map CC value to True/False
+                # Use threshold: CC >= 64 = True, CC < 64 = False
+                mapped_val = bool(cc_value >= 64)
+            else:
+                # For numeric: linear interpolation
+                mapped_val = min_val + (max_val - min_val) * (cc_value / 127.0)
+            
+            # Apply the mapped value
+            par.val = mapped_val
+            
+            # Optimized cooking: only force cook if configured
+            if FORCE_COOK_SOPS:
+                sop.cook(force=True)
+            else:
+                sop.cook()  # Let TouchDesigner cook naturally (faster, usually immediate)
+            
+            debug_print(f"[CC] CC {cc_number} = {cc_value} -> {target['geo']}.{target['param']} = {mapped_val:.3f}")
+            
+        except Exception as e:
+            print(f"[CC ERROR] CC {cc_number}: Failed to set parameter value: {e}")

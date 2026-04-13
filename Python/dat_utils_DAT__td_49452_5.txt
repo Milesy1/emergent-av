@@ -1,0 +1,49 @@
+# utils_DAT - General utility functions
+
+import random
+
+def scale_value(val, in_min, in_max, out_min, out_max, curve='linear'):
+    normalized = (val - in_min) / (in_max - in_min)
+    if curve == 'exponential':
+        normalized **= 2
+    elif curve == 'logarithmic':
+        normalized **= 0.5
+    return out_min + (normalized * (out_max - out_min))
+
+def apply_variation(value, chaos_amount=0.0):
+    if chaos_amount > 0:
+        variation = random.uniform(-1, 1) * chaos_amount
+        return value * (1 + variation)
+    return value
+
+def get_or_create_sop(geo_path, sop_type='grid', name='grid1'):
+    geo = op(geo_path)
+    if not geo:
+        print(f"ERROR: Geometry COMP not found: {geo_path}")
+        return None
+    # Return first SOP if exists
+    if geo.children:
+        return geo.children[0]
+    # Otherwise create a SOP
+    sop = geo.create(sopType=sop_type, name=name)
+    print(f"Created {sop_type} SOP: {sop.path}")
+    return sop
+
+def get_numeric_par(sop, par_name):
+    if sop is None: return None
+    par = getattr(sop.par, par_name, None)
+    if par and par.isNumeric:
+        return par
+    return None
+
+def get_note_name(channel_name):
+    for part in channel_name.split(':'):
+        if 'note_' in part:
+            return part
+    return channel_name
+
+def get_cc_name(channel_name):
+    for part in channel_name.split(':'):
+        if 'cc' in part.lower():
+            return part
+    return channel_name

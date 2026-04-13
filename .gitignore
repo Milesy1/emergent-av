@@ -1,0 +1,28 @@
+# TouchDesigner
+*.toe.bak
+*.tox.bak
+Backup/
+*.log
+td-build/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# NSSM / Windows service
+*.pid
+
+# Cursor
+.cursor/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

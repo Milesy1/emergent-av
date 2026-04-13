@@ -1,0 +1,5 @@
+node = op('/project1/sop_pool/box01')
+if node:
+    params = [par.name for par in node.pars()]
+    for name in sorted(params):
+        print(name)
