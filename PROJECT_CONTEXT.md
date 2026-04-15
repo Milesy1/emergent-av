@@ -31,9 +31,9 @@ https://github.com/Milesy1/emergent-av
 ---
 
 ### Confirmed TD project structure
-*Last verified by MCP scan 12/04/2026*
+*Last verified by MCP scan 15/04/2026*
 
-**`/project1`** — 7 direct children:
+**`/project1`** — 9 direct children:
 
 | Operator | Type | Notes |
 |---|---|---|
@@ -44,6 +44,8 @@ https://github.com/Milesy1/emergent-av
 | `modular_render` | containerCOMP | render pipeline |
 | `debug_text` | textTOP | |
 | `mcp_webserver_base` | baseCOMP | MCP server — do not modify |
+| `osc_ff` | oscinCHOP | Receives Fragment Flow OSC on port 9000. netaddress must be `127.0.0.1` (not `localhost` — IPv6 conflict). Requires Windows Firewall inbound UDP 9000 rule for TD process. |
+| `null_ff` | nullCHOP | Stable reference point downstream of `osc_ff` |
 
 ---
 
@@ -231,12 +233,17 @@ Status: working — 4 geometry COMPs with Line MATs rendering confirmed.
 
 5. **`pool__manager_DAT.randomize_all` silent bug** — `if 'tx' in geo.pars()` always evaluates to `False` because `pars()` returns Par objects, not strings. Position randomisation never executes despite appearing to run successfully.
 
+6. **TD OSC `netaddress` must be `127.0.0.1`** — setting `netaddress` to `localhost` causes TD to bind on IPv6 (`::1`), breaking UDP receive from Ableton which sends on IPv4. Fix via Textport: `op('/project1/osc_ff').par.netaddress.val = '127.0.0.1'`
+
+7. **Windows Firewall rule required for OSC receive** — inbound UDP port 9000 must be explicitly allowed for the TouchDesigner process. Rule name: `TouchDesigner OSC UDP 9000`. Add via elevated PowerShell: `New-NetFirewallRule -DisplayName "TouchDesigner OSC UDP 9000" -Direction Inbound -Protocol UDP -LocalPort 9000 -Action Allow -Profile Any`
+
 ---
 
 ### Current build status
 - Render pipeline working ✓
 - TDAbleton MIDI input working ✓
 - MCP connected ✓
+- OSC bridge (Fragment Flow → TD) working ✓ — `/live_amp1` channel confirmed live on `osc_ff`
 - Gate system not yet built
 - OSC bridge (FastAPI) not yet built
 - Claude API integration not yet built
